@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
@@ -195,6 +195,12 @@ static int drain_rq_cpu_stop(void *data)
 	rq_lock_irqsave(rq, &rf);
 	/* rq lock is pinned */
 
+	/* bail out if this cpu is no longer in the halt mask */
+	if (!cpumask_test_cpu(cpu_of(rq), cpu_halt_mask)) {
+		rq_unlock_irqrestore(rq, &rf);
+		return 0;
+	}
+
 	/* migrate tasks assumes that the lock is pinned, and will unlock/repin */
 	migrate_tasks(rq, &rf);
 
@@ -208,8 +214,9 @@ static int drain_rq_cpu_stop(void *data)
 	 */
 	wrq->enqueue_counter = 0;
 	__balance_callbacks(rq);
-	if (wrq->enqueue_counter)
-		WALT_BUG(WALT_BUG_WALT, NULL, "cpu: %d task was re-enqueued", cpu_of(rq));
+	if (wrq->enqueue_counter && cpumask_test_cpu(cpu_of(rq), cpu_halt_mask))
+		WALT_BUG(WALT_BUG_BRINGUP, NULL, "cpu: %d task was re-enqueued",
+			 cpu_of(rq));
 
 	/* lock is no longer pinned, raw unlock using same flags as locking */
 	raw_spin_rq_unlock_irqrestore(rq, rf.flags);
@@ -278,22 +285,22 @@ void restrict_cpus_and_freq(struct cpumask *cpus)
 			!cpumask_intersects(cpus, cpu_halt_mask) &&
 			is_state1()) {
 		for_each_cpu(cpu, cpus)
-			fmax_cap[PARTIAL_HALT_CAP][cpu_cluster(cpu)->id] =
+			freq_cap[PARTIAL_HALT_CAP][cpu_cluster(cpu)->id] =
 				sysctl_max_freq_partial_halt;
 	} else {
 		for_each_cpu(cpu, cpus) {
 			cpumask_or(&restrict_cpus, &restrict_cpus, &(cpu_cluster(cpu)->cpus));
-			fmax_cap[PARTIAL_HALT_CAP][cpu_cluster(cpu)->id] =
+			freq_cap[PARTIAL_HALT_CAP][cpu_cluster(cpu)->id] =
 				FREQ_QOS_MAX_DEFAULT_VALUE;
 		}
 	}
 
-	update_fmax_cap_capacities();
+	update_smart_freq_capacities();
 }
 
 struct task_struct *walt_drain_thread;
 
-static int halt_cpus(struct cpumask *cpus, enum pause_type type)
+static int halt_cpus(struct cpumask *cpus, enum pause_type type, enum pause_client client)
 {
 	int cpu;
 	int ret = 0;
@@ -336,13 +343,13 @@ static int halt_cpus(struct cpumask *cpus, enum pause_type type)
 		wake_up_process(walt_drain_thread);
 	}
 out:
-	trace_halt_cpus(cpus, start_time, 1, ret);
+	trace_halt_cpus(cpus, start_time, 1, ret, client);
 
 	return ret;
 }
 
 /* start the cpus again, and kick them to balance */
-static int start_cpus(struct cpumask *cpus, enum pause_type type)
+static int start_cpus(struct cpumask *cpus, enum pause_type type, enum pause_client client)
 {
 	u64 start_time = sched_clock();
 	struct halt_cpu_state *halt_cpu_state;
@@ -369,7 +376,7 @@ static int start_cpus(struct cpumask *cpus, enum pause_type type)
 
 	restrict_cpus_and_freq(cpus);
 
-	trace_halt_cpus(cpus, start_time, 0, 0);
+	trace_halt_cpus(cpus, start_time, 0, 0, client);
 
 	return 0;
 }
@@ -422,7 +429,7 @@ static int walt_halt_cpus(struct cpumask *cpus, enum pause_client client, enum p
 		goto unlock;
 	}
 
-	ret = halt_cpus(cpus, type);
+	ret = halt_cpus(cpus, type, client);
 
 	if (ret < 0)
 		pr_debug("halt_cpus failure ret=%d cpus=%*pbl\n", ret,
@@ -465,7 +472,7 @@ static int walt_start_cpus(struct cpumask *cpus, enum pause_client client, enum 
 	/* remove cpus that should still be halted */
 	update_halt_cpus(cpus, type);
 
-	ret = start_cpus(cpus, type);
+	ret = start_cpus(cpus, type, client);
 
 	if (ret < 0) {
 		pr_debug("halt_cpus failure ret=%d cpus=%*pbl\n", ret,
@@ -495,36 +502,17 @@ int walt_partial_resume_cpus(struct cpumask *cpus, enum pause_client client)
 }
 EXPORT_SYMBOL_GPL(walt_partial_resume_cpus);
 
-/**
- * cpus_halted_by_client: determine if client has halted a cpu
- *   where all cpus in the mask are halted.
- *
- * If all cpus in the cluster are halted, and one of them is
- * halted for this client, then and only then indicate pass.
- *
- * Otherwise, if not all cpus are halted, or none of the cpus
- * are halted by this particular client, then reject.
- *
- * return true if conditions are met, false otherwise.
- */
+/* return true if the requested client has fully halted one of the cpus */
 bool cpus_halted_by_client(struct cpumask *cpus, enum pause_client client)
 {
 	struct halt_cpu_state *halt_cpu_state;
-	bool cpu_halted_for_client = false;
 	int cpu;
 
 	for_each_cpu(cpu, cpus) {
 		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
-
-		if (!halt_cpu_state->client_vote_mask[HALT])
-			return false;
-
-		if (halt_cpu_state->client_vote_mask[HALT] & client)
-			cpu_halted_for_client = true;
+		if ((bool)(halt_cpu_state->client_vote_mask[HALT] & client))
+			return true;
 	}
-
-	if (cpu_halted_for_client)
-		return true;
 
 	return false;
 }
@@ -594,7 +582,6 @@ static void android_rvh_get_nohz_timer_target(void *unused, int *cpu, bool *done
 
 		/* choose any active unhalted cpu */
 		default_cpu = cpumask_any(&active_unhalted);
-
 		if (unlikely(default_cpu >= nr_cpu_ids))
 			goto unlock;
 	}
